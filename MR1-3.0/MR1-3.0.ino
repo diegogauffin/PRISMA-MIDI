@@ -11,7 +11,8 @@
  * - 8 Buttons: Pins 2, 3, 4, 5, 6, 7, 14, 15
  * - 5 Bank LEDs (Discrete): Pins 8, 9, 10, 11, 12
  * - 1 Neopixel: Pin 1 (Feedback for Pin 3 button)
- * - 2 Expression Pedals: A0, A1
+ * - 2 Expression Pedals: A0, A2
+ * Pin A1 no funciona 
  */
 
 // --- HARDWARE CONFIGURATION ---
@@ -24,6 +25,7 @@ const uint8_t BANK_INDICATOR_TYPE = 1; // 1 = Discrete LEDs
 const uint8_t HAS_SERIAL_OUT = 1;
 
 const uint8_t TOTAL_BUTTONS = NUM_MAIN_BUTTONS + NUM_AUX_JACKS;
+const uint8_t NEOPIXEL_BTN_INDEX = 1; // Default index for hardware specific Neopixel pin
 
 // PINES
 constexpr uint8_t BUTTON_PINS[TOTAL_BUTTONS] = {2, 3, 4, 5, 6, 7, 14, 15};
@@ -254,7 +256,7 @@ public:
       if (cfg.mode == ButtonMode::Latched) {
         cfg.flags ^= 0x01; // Toggle latched bit
         sendValue((cfg.flags & 0x01) ? 127 : 0, b);
-        saveConfigs();
+        // REMOVED: saveConfigs() to prevent EEPROM wear!
       } else if (cfg.mode == ButtonMode::BankInc)
         bank.select((b + 1) % NUM_BANKS);
       else if (cfg.mode == ButtonMode::BankDec)
@@ -349,7 +351,7 @@ public:
           auto &cfg = gConfig.buttons[b][idx];
           cfg.mode = (ButtonMode)msg.data[6];
           cfg.number = msg.data[7];
-          cfg.channel = msg.data[8];
+          cfg.channel = constrain(msg.data[8], 1, 16);
           cfg.r = (msg.data[9] << 7) | msg.data[10];
           cfg.g = (msg.data[11] << 7) | msg.data[12];
           cfg.b = (msg.data[13] << 7) | msg.data[14];
@@ -362,7 +364,7 @@ public:
         uint8_t idx = msg.data[5];
         if (idx < N_ANALOGS) {
           gConfig.analogs[idx].number = msg.data[6];
-          gConfig.analogs[idx].channel = msg.data[7];
+          gConfig.analogs[idx].channel = constrain(msg.data[7], 1, 16);
           gConfig.analogs[idx].minValue = (msg.data[8] << 7) | msg.data[9];
           gConfig.analogs[idx].maxValue = (msg.data[10] << 7) | msg.data[11];
           saveConfigs();
@@ -428,7 +430,7 @@ public:
             auto &cfg = gConfig.buttons[b][i];
             cfg.mode = (ButtonMode)msg.data[base];
             cfg.number = msg.data[base + 1];
-            cfg.channel = msg.data[base + 2];
+            cfg.channel = constrain(msg.data[base + 2], 1, 16);
             cfg.r = (msg.data[base + 3] << 7) | msg.data[base + 4];
             cfg.g = (msg.data[base + 5] << 7) | msg.data[base + 6];
             cfg.b = (msg.data[base + 7] << 7) | msg.data[base + 8];
@@ -457,16 +459,16 @@ void refreshBankLEDs() {
 
 void updateButtonLeds() {
   uint8_t b = bank.getSelection();
-  // Neopixel linked to Index 1 (Pin 3)
-  auto &cfg = gConfig.buttons[b][1];
+  // Neopixel linked to specific button index
+  auto &cfg = gConfig.buttons[b][NEOPIXEL_BTN_INDEX];
   uint32_t color = 0;
   bool isOn = false;
 
   // 1. Check if it's a Global Bank Button
-  if (1 == gConfig.bankIncBtn || 1 == gConfig.bankDecBtn) {
+  if (NEOPIXEL_BTN_INDEX == gConfig.bankIncBtn || NEOPIXEL_BTN_INDEX == gConfig.bankDecBtn) {
     isOn = true;
     uint8_t br = (gConfig.globalBr > 210) ? 210 : gConfig.globalBr;
-    if (dynButtons[1].isPressed())
+    if (dynButtons[NEOPIXEL_BTN_INDEX].isPressed())
       color = pixel.Color(255, 255, 255);
     else
       color = pixel.Color(br, br, br);
@@ -479,24 +481,28 @@ void updateButtonLeds() {
     } else if (cfg.mode == ButtonMode::BankInc ||
                cfg.mode == ButtonMode::BankDec) {
       isOn = true;
-      if (dynButtons[1].isPressed())
+      if (dynButtons[NEOPIXEL_BTN_INDEX].isPressed())
         color = pixel.Color(255, 255, 255);
       else
         color = pixel.Color((cfg.r * cfg.brightness) / 255,
                             (cfg.g * cfg.brightness) / 255,
                             (cfg.b * cfg.brightness) / 255);
     } else {
-      isOn = dynButtons[1].isPressed() || alwaysOn;
+      isOn = dynButtons[NEOPIXEL_BTN_INDEX].isPressed() || alwaysOn;
     }
+  }
 
-    if (color == 0) {
+  // 3. Finalize Color and State
+  if (isOn) {
+    if (color == 0) { // Fallback to base configuration color
       color = pixel.Color((cfg.r * cfg.brightness) / 255,
                           (cfg.g * cfg.brightness) / 255,
                           (cfg.b * cfg.brightness) / 255);
     }
+    pixel.setPixelColor(0, color);
+  } else {
+    pixel.setPixelColor(0, 0); // Completely off
   }
-
-  pixel.setPixelColor(0, isOn ? color : 0);
   pixel.show();
 }
 

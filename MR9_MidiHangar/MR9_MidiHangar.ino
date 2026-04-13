@@ -233,7 +233,7 @@ public:
         uint8_t b = msg.data[4]; uint8_t idx = msg.data[5];
         if (b < NUM_BANKS && idx < TOTAL_BUTTONS) {
             auto &cfg = gConfig.buttons[b][idx];
-            cfg.mode = (ButtonMode)msg.data[6]; cfg.number = msg.data[7]; cfg.channel = msg.data[8];
+            cfg.mode = (ButtonMode)msg.data[6]; cfg.number = msg.data[7]; cfg.channel = constrain(msg.data[8], 1, 16);
             cfg.r = (msg.data[9] << 7) | msg.data[10]; cfg.g = (msg.data[11] << 7) | msg.data[12];
             cfg.b = (msg.data[13] << 7) | msg.data[14]; cfg.brightness = (msg.data[15] << 7) | msg.data[16];
             saveConfigs();
@@ -244,7 +244,7 @@ public:
            gConfig.analogs[idx].minValue = (msg.data[5] << 7) | msg.data[6]; 
            gConfig.analogs[idx].maxValue = (msg.data[7] << 7) | msg.data[8];
            gConfig.analogs[idx].number = msg.data[9]; 
-           gConfig.analogs[idx].channel = msg.data[10];
+           gConfig.analogs[idx].channel = constrain(msg.data[10], 1, 16);
            saveConfigs();
         }
       } else if (cmd == CMD_SET_GLOBAL && msg.length >= 7) { 
@@ -263,7 +263,7 @@ public:
             auto &cfg = gConfig.buttons[b][i];
             cfg.mode = (ButtonMode)msg.data[base];
             cfg.number = msg.data[base + 1];
-            cfg.channel = msg.data[base + 2];
+            cfg.channel = constrain(msg.data[base + 2], 1, 16);
             cfg.r = (msg.data[base + 3] << 7) | msg.data[base + 4];
             cfg.g = (msg.data[base + 5] << 7) | msg.data[base + 6];
             cfg.b = (msg.data[base + 7] << 7) | msg.data[base + 8];
@@ -296,6 +296,7 @@ void updateBankLeds() {
     for(uint8_t i = 0; i < NUM_MAIN_BUTTONS; i++) {
         bool isOn = false;
         uint32_t color = 0;
+        
         if (i == gConfig.bankIncBtn || i == gConfig.bankDecBtn) {
             isOn = true;
             uint8_t br = (gConfig.globalBr > 200) ? 200 : gConfig.globalBr;
@@ -303,13 +304,19 @@ void updateBankLeds() {
             else color = applyBrightness(255, 255, 255, br);
         } else {
             auto &cfg = gConfig.buttons[b][i];
-            if (cfg.mode == ButtonMode::Latched) isOn = cfg.latchedState;
-            else if (cfg.mode == ButtonMode::BankInc || cfg.mode == ButtonMode::BankDec) {
+            if (cfg.mode == ButtonMode::Latched) {
+                isOn = cfg.latchedState;
+            } else if (cfg.mode == ButtonMode::BankInc || cfg.mode == ButtonMode::BankDec) {
+                isOn = true;
+                if (dynButtons[i].isPressed()) color = applyBrightness(255, 255, 255, 255);
+                else color = applyBrightness(cfg.r, cfg.g, cfg.b, cfg.brightness);
+            } else {
                 isOn = dynButtons[i].isPressed();
-                color = applyBrightness(255, 255, 255, cfg.brightness);
-            } else isOn = dynButtons[i].isPressed();
-            if (color == 0) color = applyBrightness(cfg.r, cfg.g, cfg.b, cfg.brightness);
+            }
+            
+            if (isOn && color == 0) color = applyBrightness(cfg.r, cfg.g, cfg.b, cfg.brightness);
         }
+        
         strip.setPixelColor(i, isOn ? color : 0);
     }
     strip.show();

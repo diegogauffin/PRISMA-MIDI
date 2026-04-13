@@ -255,7 +255,7 @@ public:
       if (cfg.mode == ButtonMode::Latched) { 
           cfg.flags ^= 0x01; // Toggle latched bit
           sendValue((cfg.flags & 0x01) ? 127 : 0, b);
-          saveConfigs(); 
+          // REMOVED: saveConfigs() to prevent EEPROM wear
       }
       else if (cfg.mode == ButtonMode::BankInc) bank.select((b + 1) % NUM_BANKS);
       else if (cfg.mode == ButtonMode::BankDec) bank.select(b == 0 ? NUM_BANKS - 1 : b - 1);
@@ -312,7 +312,7 @@ public:
         uint8_t b = msg.data[4]; uint8_t idx = msg.data[5];
         if (b < NUM_BANKS && idx < TOTAL_BUTTONS) {
             auto &cfg = gConfig.buttons[b][idx];
-            cfg.mode = (ButtonMode)msg.data[6]; cfg.number = msg.data[7]; cfg.channel = msg.data[8];
+            cfg.mode = (ButtonMode)msg.data[6]; cfg.number = msg.data[7]; cfg.channel = constrain(msg.data[8], 1, 16);
             cfg.r = (msg.data[9]<<7)|msg.data[10]; cfg.g = (msg.data[11]<<7)|msg.data[12];
             cfg.b = (msg.data[13]<<7)|msg.data[14]; cfg.brightness = (msg.data[15]<<7)|msg.data[16];
             if (msg.length >= 19) cfg.flags = msg.data[17];
@@ -322,7 +322,7 @@ public:
         uint8_t idx = msg.data[5];
         if (idx < N_ANALOGS) {
             gConfig.analogs[idx].number = msg.data[6];
-            gConfig.analogs[idx].channel = msg.data[7];
+            gConfig.analogs[idx].channel = constrain(msg.data[7], 1, 16);
             gConfig.analogs[idx].minValue = (msg.data[8] << 7) | msg.data[9];
             gConfig.analogs[idx].maxValue = (msg.data[10] << 7) | msg.data[11];
             saveConfigs();
@@ -368,7 +368,7 @@ public:
         if (b < NUM_BANKS) {
           for (uint8_t i = 0; i < TOTAL_BUTTONS; i++) {
             uint16_t base = 5 + (i * bytesPerBtn); auto &cfg = gConfig.buttons[b][i];
-            cfg.mode = (ButtonMode)msg.data[base]; cfg.number = msg.data[base+1]; cfg.channel = msg.data[base+2];
+            cfg.mode = (ButtonMode)msg.data[base]; cfg.number = msg.data[base+1]; cfg.channel = constrain(msg.data[base+2], 1, 16);
             cfg.r = (msg.data[base+3]<<7)|msg.data[base+4]; cfg.g = (msg.data[base+5]<<7)|msg.data[base+6];
             cfg.b = (msg.data[base+7]<<7)|msg.data[base+8]; cfg.brightness = (msg.data[base+9]<<7)|msg.data[base+10]; 
             if (bytesPerBtn == 12) cfg.flags = msg.data[base+11];
@@ -397,18 +397,35 @@ void updateButtonLeds() {
     for(uint8_t i = 0; i < NUM_MAIN_BUTTONS; i++) {
         auto &cfg = gConfig.buttons[b][i];
         uint32_t color = 0;
+        bool isOn = false;
         bool isGlobal = (i == gConfig.bankIncBtn || i == gConfig.bankDecBtn) && (i < TOTAL_BUTTONS);
+
         if (isGlobal) {
+            isOn = true;
             uint8_t br = (gConfig.globalBr > 210) ? 210 : gConfig.globalBr; 
-            color = stripBtns.Color(br, br, br);
             if (dynButtons[i].isPressed()) color = stripBtns.Color(255, 255, 255);
+            else color = stripBtns.Color(br, br, br);
         } else {
-            color = stripBtns.Color((cfg.r*cfg.brightness)/255, (cfg.g*cfg.brightness)/255, (cfg.b*cfg.brightness)/255);
             bool alwaysOn = (cfg.flags >> 1) & 0x01;
-            if (cfg.mode == ButtonMode::Latched) { if (!(cfg.flags & 0x01)) color = 0; } 
-            else if (!alwaysOn) { if (!dynButtons[i].isPressed()) color = 0; }
+            if (cfg.mode == ButtonMode::Latched) {
+                isOn = (cfg.flags & 0x01);
+            } else if (cfg.mode == ButtonMode::BankInc || cfg.mode == ButtonMode::BankDec) {
+                isOn = true;
+                if (dynButtons[i].isPressed()) color = stripBtns.Color(255, 255, 255);
+                else color = stripBtns.Color((cfg.r*cfg.brightness)/255, (cfg.g*cfg.brightness)/255, (cfg.b*cfg.brightness)/255);
+            } else {
+                isOn = dynButtons[i].isPressed() || alwaysOn;
+            }
         }
-        stripBtns.setPixelColor(i, color);
+
+        if (isOn) {
+            if (color == 0) { // Fallback to base configuration color
+                color = stripBtns.Color((cfg.r*cfg.brightness)/255, (cfg.g*cfg.brightness)/255, (cfg.b*cfg.brightness)/255);
+            }
+            stripBtns.setPixelColor(i, color);
+        } else {
+            stripBtns.setPixelColor(i, 0); // Completely off
+        }
     }
     stripBtns.show();
 }
