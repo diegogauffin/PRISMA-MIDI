@@ -1,0 +1,15 @@
+[00:00:02.022] Server  LOG     ✓ Ready in 1691ms
+[00:00:09.949] Browser INFO    %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold
+[00:00:17.266] Browser INFO    %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold
+[00:00:22.779] Browser INFO    %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold
+[00:05:06.310] Browser ERROR   Received NaN for the `%s` attribute. If this is expected, cast the value to a string. value
+[00:11:00.010] Server  LOG     ✓ Compiled in 68ms
+[00:28:57.465] Browser INFO    %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold
+[00:29:09.992] Browser INFO    %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold
+[01:04:42.901] Server  LOG     ✓ Compiled in 135ms
+[01:04:43.615] Server  LOG     ✓ Compiled in 108ms
+[01:04:43.753] Browser LOG     Inputs: [{}]
+[01:04:43.753] Browser LOG     Outputs: [{}]
+[01:05:03.620] Browser INFO    %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold
+[01:05:03.750] Browser LOG     Inputs: [{}]
+[01:05:03.750] Browser LOG     Outputs: [{}]
