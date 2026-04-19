@@ -80,6 +80,7 @@ struct ButtonConfig {
   uint8_t r, g, b;
   uint8_t brightness;
   uint8_t flags; // Bit 0: latchedState, Bit 1: ledAlwaysOn
+  uint8_t velocity;
 };
 
 struct AnalogConfig {
@@ -111,7 +112,7 @@ void initDefaultConfig() {
   for (uint8_t b = 0; b < NUM_BANKS; b++) {
     for (uint8_t i = 0; i < TOTAL_BUTTONS; i++) {
       gConfig.buttons[b][i] = {
-          ButtonMode::CC, (uint8_t)(20 + i), 7, 255, 255, 255, 255, 0};
+          ButtonMode::CC, (uint8_t)(20 + i), 7, 255, 255, 255, 255, 0, 127};
     }
   }
   gConfig.analogs[0] = {0, 1023, 10, 7};
@@ -128,9 +129,27 @@ void loadConfigs() {
   }
 }
 
-void saveConfigs() {
-  EEPROM.put(0, gConfig);
-  EEPROM.commit();
+bool configDirty = false;
+
+void saveConfigs(bool immediate = false) {
+  if (immediate) {
+    EEPROM.put(0, gConfig);
+    EEPROM.commit();
+    configDirty = false;
+    return;
+  }
+  configDirty = true;
+}
+
+void processPendingSave() {
+  static unsigned long lastSave = 0;
+  if (configDirty && (millis() - lastSave > 1500)) {
+    EEPROM.put(0, gConfig);
+    EEPROM.commit();
+    lastSave = millis();
+    configDirty = false;
+    Serial.println("EEPROM: Saved changes");
+  }
 }
 
 // --- GLOBALS ---
@@ -256,7 +275,6 @@ public:
       if (cfg.mode == ButtonMode::Latched) {
         cfg.flags ^= 0x01; // Toggle latched bit
         sendValue((cfg.flags & 0x01) ? 127 : 0, b);
-        // REMOVED: saveConfigs() to prevent EEPROM wear!
       } else if (cfg.mode == ButtonMode::BankInc)
         bank.select((b + 1) % NUM_BANKS);
       else if (cfg.mode == ButtonMode::BankDec)
@@ -277,8 +295,8 @@ private:
                               Channel(constrain((int)cfg.channel - 1, 0, 15))};
     if (cfg.mode == ButtonMode::Note) {
       if (value > 0) {
-        usbmidi.sendNoteOn(addr, 127);
-        serialmidi.sendNoteOn(addr, 127);
+        usbmidi.sendNoteOn(addr, cfg.velocity);
+        serialmidi.sendNoteOn(addr, cfg.velocity);
       } else {
         usbmidi.sendNoteOff(addr, 0);
         serialmidi.sendNoteOff(addr, 0);
@@ -340,8 +358,9 @@ public:
                            (uint8_t)(cfg.b & 127),
                            (uint8_t)((cfg.brightness >> 7) & 1),
                            (uint8_t)(cfg.brightness & 127),
-                           cfg.flags};
-            sendSysExResponse(CMD_CONFIG_RESPONSE, d, 14);
+                           cfg.flags,
+                           cfg.velocity};
+            sendSysExResponse(CMD_CONFIG_RESPONSE, d, 15);
           }
         }
       } else if (cmd == CMD_SET_CONFIG && msg.length >= 18) {
@@ -358,6 +377,8 @@ public:
           cfg.brightness = (msg.data[15] << 7) | msg.data[16];
           if (msg.length >= 19)
             cfg.flags = msg.data[17];
+          if (msg.length >= 20)
+            cfg.velocity = msg.data[18];
           saveConfigs();
         }
       } else if (cmd == CMD_SET_ANALOG && msg.length >= 12) {
@@ -422,8 +443,11 @@ public:
         }
       } else if (cmd == CMD_SET_BANK_BULK) {
         uint8_t b = msg.data[4];
-        uint8_t bytesPerBtn =
-            (msg.length >= (5 + (TOTAL_BUTTONS * 12))) ? 12 : 11;
+        uint8_t bytesPerBtn = (msg.length >= (5 + (TOTAL_BUTTONS * 13)))
+                                  ? 13
+                                  : ((msg.length >= (5 + (TOTAL_BUTTONS * 12)))
+                                         ? 12
+                                         : 11);
         if (b < NUM_BANKS) {
           for (uint8_t i = 0; i < TOTAL_BUTTONS; i++) {
             uint16_t base = 5 + (i * bytesPerBtn);
@@ -435,8 +459,10 @@ public:
             cfg.g = (msg.data[base + 5] << 7) | msg.data[base + 6];
             cfg.b = (msg.data[base + 7] << 7) | msg.data[base + 8];
             cfg.brightness = (msg.data[base + 9] << 7) | msg.data[base + 10];
-            if (bytesPerBtn == 12)
+            if (bytesPerBtn >= 12)
               cfg.flags = msg.data[base + 11];
+            if (bytesPerBtn >= 13)
+              cfg.velocity = msg.data[base + 12];
           }
           saveConfigs();
         }
@@ -533,13 +559,12 @@ void setup() {
 
 void loop() {
   Control_Surface.loop();
-  for (auto &b : dynButtons)
-    b.update();
-  potentiometer1.update();
-  potentiometer2.update();
-
-  updateButtonLeds();
+  for (uint8_t i = 0; i < TOTAL_BUTTONS; i++) {
+    dynButtons[i].update();
+  }
   refreshBankLEDs();
+  updateButtonLeds();
+  processPendingSave();
 
   // Pot Live Stream (Hangar View)
   static uint16_t lastP[2] = {0, 0};

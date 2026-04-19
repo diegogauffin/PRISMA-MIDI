@@ -50,6 +50,8 @@ const uint8_t CMD_BTN_PRESS       = 0x0A;
 const uint8_t CMD_POT_LIVE        = 0x0B;
 const uint8_t CMD_CALIBRATE_POT   = 0x0C;
 const uint8_t CMD_SET_BANK_LEDS   = 0x0D;
+const uint8_t CMD_SET_METRO       = 0x10;
+const uint8_t CMD_GET_METRO       = 0x11;
 
 // ============================================================================
 // CONFIGURACIÓN Y MEMORIA
@@ -71,6 +73,12 @@ struct Configuration {
   uint8_t deviceId = 0x01;
   uint8_t bankIncBtn = 255; uint8_t bankDecBtn = 255; uint8_t globalBr = 150; 
   uint8_t bankR = 255; uint8_t bankG = 0; uint8_t bankB = 255; uint8_t bankBr = 130;
+  
+  // Metronome / Global Appearance
+  uint8_t tapTempoBtn = 255;
+  uint8_t metroR = 255; uint8_t metroG = 255; uint8_t metroB = 255; uint8_t metroBr = 200;
+  bool metroEnabled = false;
+
   ButtonConfig buttons[NUM_BANKS][TOTAL_BUTTONS];
   AnalogConfig analogs[N_ANALOGS];
 };
@@ -307,8 +315,23 @@ private:
 
 DynamicButton dynButtons[TOTAL_BUTTONS] = { {0,2},{1,3},{2,4},{3,5},{4,6},{5,7},{6,8},{7,9} };
 
+uint8_t clockCounter = 0;
+bool isBeat = false;
+unsigned long beatOffTime = 0;
+
 class MyMIDIInput : public MIDI_Callbacks {
 public:
+  void onRealTimeMessage(MIDI_Interface &, RealTimeMessage rt) override {
+    if (gConfig.metroEnabled && rt.message == 0xF8) { // MIDI Clock
+        clockCounter++;
+        if (clockCounter >= 24) { // Start of Beat
+            clockCounter = 0;
+            isBeat = true;
+            beatOffTime = millis() + 80; // Pulse duration: 80ms
+        }
+    }
+  }
+
   void onSysExMessage(MIDI_Interface &midi_if, SysExMessage msg) override {
     if (msg.length >= 5 && msg.data[1] == SYSEX_MAN_ID && msg.data[2] == gConfig.deviceId) {
       uint8_t cmd = msg.data[3];
@@ -381,20 +404,42 @@ public:
         gConfig.bankR = (msg.data[4]<<7)|msg.data[5]; gConfig.bankG = (msg.data[6]<<7)|msg.data[7];
         gConfig.bankB = (msg.data[8]<<7)|msg.data[9]; gConfig.bankBr = (msg.data[10]<<7)|msg.data[11];
         saveConfigs(); refreshBankLEDs(true);
-      } else if (cmd == CMD_SET_BANK_BULK) {
-        uint8_t b = msg.data[4]; 
-        uint8_t bytesPerBtn = (msg.length >= (5 + (TOTAL_BUTTONS * 13))) ? 13 : (msg.length >= (5 + (TOTAL_BUTTONS * 12)) ? 12 : 11);
-        if (b < NUM_BANKS) {
-          for (uint8_t i = 0; i < TOTAL_BUTTONS; i++) {
-            uint16_t base = 5 + (i * bytesPerBtn); auto &cfg = gConfig.buttons[b][i];
-            cfg.mode = (ButtonMode)msg.data[base]; cfg.number = msg.data[base+1]; cfg.channel = constrain(msg.data[base+2], 1, 16);
-            cfg.r = (msg.data[base+3]<<7)|msg.data[base+4]; cfg.g = (msg.data[base+5]<<7)|msg.data[base+6];
-            cfg.b = (msg.data[base+7]<<7)|msg.data[base+8]; cfg.brightness = (msg.data[base+9]<<7)|msg.data[base+10]; 
-            if (bytesPerBtn >= 12) cfg.flags = msg.data[base+11];
-            if (bytesPerBtn >= 13) cfg.velocity = msg.data[base+12];
-          }
-          saveConfigs(); updateButtonLeds();
-        }
+      } else if (cmd == CMD_SET_METRO && msg.length >= 10) {
+        gConfig.tapTempoBtn = msg.data[4];
+        gConfig.metroR = (msg.data[5]<<7)|msg.data[6];
+        gConfig.metroG = (msg.data[7]<<7)|msg.data[8];
+        gConfig.metroB = (msg.data[9]<<7)|msg.data[10];
+        gConfig.metroBr = msg.data[11];
+        gConfig.metroEnabled = msg.data[12];
+        saveConfigs();
+      } else if (cmd == CMD_SET_GLOBAL && msg.length >= 10) {
+        gConfig.bankIncBtn = msg.data[4];
+        gConfig.bankDecBtn = msg.data[5];
+        gConfig.globalBr = msg.data[6];
+        gConfig.bankR = (msg.data[7] << 7) | msg.data[8];
+        gConfig.bankG = (msg.data[9] << 7) | msg.data[10];
+        gConfig.bankB = (msg.data[11] << 7) | msg.data[12];
+        gConfig.bankBr = msg.data[13];
+        saveConfigs();
+      } else if (cmd == CMD_GET_GLOBAL) {
+        uint8_t d[] = { 
+          0xF0, SYSEX_MAN_ID, gConfig.deviceId, CMD_GET_GLOBAL,
+          gConfig.bankIncBtn, gConfig.bankDecBtn, gConfig.globalBr,
+          (uint8_t)((gConfig.bankR >> 7) & 1), (uint8_t)(gConfig.bankR & 127),
+          (uint8_t)((gConfig.bankG >> 7) & 1), (uint8_t)(gConfig.bankG & 127),
+          (uint8_t)((gConfig.bankB >> 7) & 1), (uint8_t)(gConfig.bankB & 127),
+          gConfig.bankBr, 0xF7 
+        };
+        usbmidi.sendSysEx(d, sizeof(d));
+      } else if (cmd == CMD_GET_METRO) {
+        uint8_t d[] = { 
+            gConfig.tapTempoBtn,
+            (uint8_t)((gConfig.metroR>>7)&1), (uint8_t)(gConfig.metroR&127),
+            (uint8_t)((gConfig.metroG>>7)&1), (uint8_t)(gConfig.metroG&127),
+            (uint8_t)((gConfig.metroB>>7)&1), (uint8_t)(gConfig.metroB&127),
+            gConfig.metroBr, (uint8_t)gConfig.metroEnabled
+        };
+        sendSysExResponse(CMD_GET_METRO, d, sizeof(d));
       }
     }
   }
@@ -419,12 +464,16 @@ void updateButtonLeds() {
         uint32_t color = 0;
         bool isOn = false;
         bool isGlobal = (i == gConfig.bankIncBtn || i == gConfig.bankDecBtn) && (i < TOTAL_BUTTONS);
+        bool isTapTempo = (i == gConfig.tapTempoBtn) && gConfig.metroEnabled;
 
         if (isGlobal) {
             isOn = true;
             uint8_t br = (gConfig.globalBr > 210) ? 210 : gConfig.globalBr; 
             if (dynButtons[i].isPressed()) color = stripBtns.Color(255, 255, 255);
             else color = stripBtns.Color(br, br, br);
+        } else if (isTapTempo && isBeat) {
+            isOn = true;
+            color = stripBtns.Color((gConfig.metroR*gConfig.metroBr)/255, (gConfig.metroG*gConfig.metroBr)/255, (gConfig.metroB*gConfig.metroBr)/255);
         } else {
             bool alwaysOn = (cfg.flags >> 1) & 0x01;
             if (cfg.mode == ButtonMode::Latched) {
@@ -448,6 +497,23 @@ void updateButtonLeds() {
         }
     }
     stripBtns.show();
+}
+
+void processMetronome() {
+    static bool lastIsBeat = false;
+    if (millis() > beatOffTime && isBeat) {
+        isBeat = false;
+    }
+    
+    // Status LED Metronome heartbeat
+    if (gConfig.metroEnabled) {
+        if (isBeat) {
+            statusLed.setPixelColor(0, statusLed.Color((gConfig.metroR*gConfig.metroBr)/255, (gConfig.metroG*gConfig.metroBr)/255, (gConfig.metroB*gConfig.metroBr)/255));
+        } else {
+            statusLed.setPixelColor(0, statusLed.Color(5, 5, 5)); // Dim idle state
+        }
+        statusLed.show();
+    }
 }
 
 uint32_t colorWheel(byte WheelPos) {
@@ -490,6 +556,7 @@ void loop() {
     potentiometer2.update();
     updateButtonLeds(); refreshBankLEDs();
     processPendingSave();
+    processMetronome();
 
     // Pot Live Stream
     static uint16_t lastP[2] = {0,0};

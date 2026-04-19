@@ -1,6 +1,7 @@
 #include <Adafruit_NeoPixel.h>
 #include <Control_Surface.h>
 #include <EEPROM.h>
+#include <SerialPIO.h>
 
 // --- HARDWARE CONFIGURATION ---
 const uint8_t MODEL_FAMILY = 0; // MIDIROOTs
@@ -21,6 +22,12 @@ const pin_t bankLedPins[] = {9, 10, 11, 12, 13};
 
 Adafruit_NeoPixel pixels(NUMPIXELS, PIN, NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel strip(NUM_LEDS, PIN_STRIP, NEO_GRB + NEO_KHZ800);
+
+// --- MIDI INTERFACES ---
+#define PIN_SERIAL_TX 0
+SerialPIO pioSerial(PIN_SERIAL_TX, NOPIN);
+USBMIDI_Interface usbmidi;
+HardwareSerialMIDI_Interface serialmidi{pioSerial, MIDI_BAUD};
 
 // --- SYSEX CONSTANTS ---
 const uint8_t SYSEX_MAN_ID = 0x7D;
@@ -55,7 +62,8 @@ struct ButtonConfig {
     uint8_t channel;
     uint8_t r, g, b;
     uint8_t brightness;
-    bool latchedState;
+    uint8_t velocity; 
+    uint8_t flags; // Bit 0: latchedState, Bit 1: ledAlwaysOn
 };
 
 struct AnalogConfig {
@@ -87,7 +95,7 @@ void loadConfigs() {
         gConfig.globalBr = 150;
         for (uint8_t b = 0; b < NUM_BANKS; b++) {
             for (uint8_t i = 0; i < TOTAL_BUTTONS; i++) {
-                gConfig.buttons[b][i] = {(ButtonMode)0, (uint8_t)(20 + i), 7, 255, 255, 255, 255, false};
+                gConfig.buttons[b][i] = {(ButtonMode)0, (uint8_t)(20 + i), 7, 255, 255, 255, 255, 127, 0};
             }
         }
         gConfig.analogs[0] = {0, 1023, 10, 11};
@@ -97,12 +105,30 @@ void loadConfigs() {
     }
 }
 
-void saveConfigs() {
-    EEPROM.put(0, gConfig);
-    EEPROM.commit();
+bool configDirty = false;
+
+void saveConfigs(bool immediate = false) {
+    if (immediate) {
+        EEPROM.put(0, gConfig);
+        EEPROM.commit();
+        configDirty = false;
+        return;
+    }
+    configDirty = true;
 }
 
-USBMIDI_Interface midi;
+void processPendingSave() {
+    static unsigned long lastSave = 0;
+    if (configDirty && (millis() - lastSave > 1500)) {
+        EEPROM.put(0, gConfig);
+        EEPROM.commit();
+        lastSave = millis();
+        configDirty = false;
+        Serial.println("EEPROM: Saved changes");
+    }
+}
+
+// midi interfaces declared above (usbmidi + serialmidi)
 Bank<NUM_BANKS> bank(NUM_BANKS);
 
 // --- POTENTIOMETERS ---
@@ -123,6 +149,11 @@ analog_t mapPot1(analog_t raw) {
   return map(constrain(raw, minV, maxV), minV, maxV, 0, maxRawValue);
 }
 
+// --- SYSEX & MIDI CALLBACKS ---
+class MyMIDIInput; 
+void refreshBankLEDs(bool force = false);
+void updateBankLeds(bool force = false);
+
 // --- BOTONES DINÁMICOS ---
 class DynamicButton : public Updatable<MIDIOutputElement> {
 public:
@@ -135,7 +166,7 @@ public:
     if (state != AH::Button::Released && state != AH::Button::Pressed) {
       // Send Feedback to Frontend for identification
       uint8_t fbData[] = { 0xF0, SYSEX_MAN_ID, gConfig.deviceId, CMD_BTN_PRESS, index_, (uint8_t)(state == AH::Button::Falling ? 1 : 0), 0xF7 };
-      midi.sendSysEx(fbData, sizeof(fbData));
+      usbmidi.sendSysEx(fbData, sizeof(fbData));
     }
 
     if (index_ == gConfig.bankIncBtn) {
@@ -157,8 +188,8 @@ public:
     auto &cfg = gConfig.buttons[b][index_];
     if (state == AH::Button::Falling) {
       if (cfg.mode == ButtonMode::Latched) { 
-        cfg.latchedState = !cfg.latchedState; 
-        sendValue(cfg.latchedState ? 127 : 0, b); 
+        cfg.flags ^= 0x01; // Toggle latched bit
+        sendValue((cfg.flags & 0x01) ? 127 : 0, b); 
       }
       else if (cfg.mode == ButtonMode::BankInc) { 
         uint8_t next = (b + 1) >= NUM_BANKS ? 0 : b + 1;
@@ -184,9 +215,11 @@ private:
     auto &cfg = gConfig.buttons[currentBank][index_];
     const MIDIAddress addr = {cfg.number, Channel(constrain((int)cfg.channel - 1, 0, 15))};
     if (cfg.mode == ButtonMode::Note) {
-      if (value > 0) midi.sendNoteOn(addr, 127); else midi.sendNoteOff(addr, 0);
+      if (value > 0) { usbmidi.sendNoteOn(addr, cfg.velocity); serialmidi.sendNoteOn(addr, cfg.velocity); }
+      else { usbmidi.sendNoteOff(addr, 0); serialmidi.sendNoteOff(addr, 0); }
     } else {
-      midi.sendControlChange(addr, value);
+      usbmidi.sendControlChange(addr, value);
+      serialmidi.sendControlChange(addr, value);
     }
   }
   uint8_t index_; AH::Button button_;
@@ -201,7 +234,7 @@ DynamicButton dynButtons[TOTAL_BUTTONS] = {
 // --- SYSEX ---
 class MyMIDIInput : public MIDI_Callbacks {
 public:
-  void onSysExMessage(MIDI_Interface &midi_if, SysExMessage msg) override {
+  void onSysExMessage(MIDI_Interface &, SysExMessage msg) override {
     if (msg.length >= 5 && msg.data[1] == SYSEX_MAN_ID && msg.data[2] == gConfig.deviceId) {
       uint8_t cmd = msg.data[3];
       if (cmd == CMD_GET_INFO) {
@@ -211,7 +244,7 @@ public:
         data[4] = 1; data[5] = 2; data[6] = 0; data[7] = MODEL_FAMILY; data[8] = NUM_MAIN_BUTTONS;
         data[9] = N_ANALOG_INPUTS; data[10] = NUM_AUX_JACKS; data[11] = NUM_BANKS; data[12] = BANK_INDICATOR_TYPE;
         data[13] = HAS_SERIAL_OUT; data[14] = nLen; memcpy(&data[15], name, nLen); data[total - 1] = 0xF7;
-        midi_if.sendSysEx(data, total); delete[] data;
+        usbmidi.sendSysEx(data, total); delete[] data;
       } else if (cmd == CMD_GET_CONFIG) {
         uint8_t bankToFetch = (msg.length >= 6) ? msg.data[4] : 255; 
         for (uint8_t b = 0; b < NUM_BANKS; b++) {
@@ -224,18 +257,20 @@ public:
               (uint8_t)((cfg.r >> 7) & 0x01), (uint8_t)(cfg.r & 0x7F), 
               (uint8_t)((cfg.g >> 7) & 0x01), (uint8_t)(cfg.g & 0x7F), 
               (uint8_t)((cfg.b >> 7) & 0x01), (uint8_t)(cfg.b & 0x7F), 
-              (uint8_t)((cfg.brightness >> 7) & 0x01), (uint8_t)(cfg.brightness & 0x7F), 0xF7 
+              (uint8_t)((cfg.brightness >> 7) & 0x01), (uint8_t)(cfg.brightness & 0x7F),
+              cfg.flags, cfg.velocity, 0xF7 
             };
-            midi_if.sendSysEx(data, sizeof(data));
+            usbmidi.sendSysEx(data, sizeof(data));
           }
         }
-      } else if (cmd == CMD_SET_CONFIG && msg.length >= 18) {
+      } else if (cmd == CMD_SET_CONFIG && msg.length >= 19) {
         uint8_t b = msg.data[4]; uint8_t idx = msg.data[5];
         if (b < NUM_BANKS && idx < TOTAL_BUTTONS) {
             auto &cfg = gConfig.buttons[b][idx];
             cfg.mode = (ButtonMode)msg.data[6]; cfg.number = msg.data[7]; cfg.channel = constrain(msg.data[8], 1, 16);
             cfg.r = (msg.data[9] << 7) | msg.data[10]; cfg.g = (msg.data[11] << 7) | msg.data[12];
             cfg.b = (msg.data[13] << 7) | msg.data[14]; cfg.brightness = (msg.data[15] << 7) | msg.data[16];
+            cfg.flags = msg.data[17]; cfg.velocity = msg.data[18];
             saveConfigs();
         }
       } else if (cmd == CMD_SET_ANALOG && msg.length >= 11) {
@@ -254,12 +289,12 @@ public:
         saveConfigs();
       } else if (cmd == CMD_GET_GLOBAL) { 
         uint8_t data[] = { 0xF0, SYSEX_MAN_ID, gConfig.deviceId, 0x08, gConfig.bankIncBtn, gConfig.bankDecBtn, gConfig.globalBr, 0xF7 };
-        midi_if.sendSysEx(data, sizeof(data));
-      } else if (cmd == CMD_SET_BANK_BULK && msg.length >= (5 + (TOTAL_BUTTONS * 11))) {
+        usbmidi.sendSysEx(data, sizeof(data));
+      } else if (cmd == CMD_SET_BANK_BULK && msg.length >= (5 + (TOTAL_BUTTONS * 13))) {
         uint8_t b = msg.data[4];
         if (b < NUM_BANKS) {
           for (uint8_t i = 0; i < TOTAL_BUTTONS; i++) {
-            uint16_t base = 5 + (i * 11);
+            uint16_t base = 5 + (i * 13);
             auto &cfg = gConfig.buttons[b][i];
             cfg.mode = (ButtonMode)msg.data[base];
             cfg.number = msg.data[base + 1];
@@ -268,6 +303,8 @@ public:
             cfg.g = (msg.data[base + 5] << 7) | msg.data[base + 6];
             cfg.b = (msg.data[base + 7] << 7) | msg.data[base + 8];
             cfg.brightness = (msg.data[base + 9] << 7) | msg.data[base + 10];
+            cfg.flags = msg.data[base + 11];
+            cfg.velocity = msg.data[base + 12];
           }
           saveConfigs();
         }
@@ -283,16 +320,21 @@ uint32_t applyBrightness(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness) {
   return strip.Color((r * brightness) / 255, (g * brightness) / 255, (b * brightness) / 255);
 }
 
-void refreshBankLEDs() {
+void refreshBankLEDs(bool force) {
   uint8_t sel = bank.getSelection();
+  static uint8_t lastSel = 255;
+  if (!force && sel == lastSel) return;
   for(uint8_t i=0; i<5; i++) {
-    pinMode(bankLedPins[i], OUTPUT);
     digitalWrite(bankLedPins[i], (i == sel) ? HIGH : LOW);
   }
+  lastSel = sel;
 }
 
-void updateBankLeds() {
+void updateBankLeds(bool force) {
     uint8_t b = bank.getSelection();
+    static uint32_t lastColors[NUM_MAIN_BUTTONS];
+    bool changed = force;
+    
     for(uint8_t i = 0; i < NUM_MAIN_BUTTONS; i++) {
         bool isOn = false;
         uint32_t color = 0;
@@ -304,30 +346,50 @@ void updateBankLeds() {
             else color = applyBrightness(255, 255, 255, br);
         } else {
             auto &cfg = gConfig.buttons[b][i];
+            bool alwaysOn = (cfg.flags >> 1) & 0x01;
             if (cfg.mode == ButtonMode::Latched) {
-                isOn = cfg.latchedState;
+                isOn = (cfg.flags & 0x01);
             } else if (cfg.mode == ButtonMode::BankInc || cfg.mode == ButtonMode::BankDec) {
                 isOn = true;
                 if (dynButtons[i].isPressed()) color = applyBrightness(255, 255, 255, 255);
                 else color = applyBrightness(cfg.r, cfg.g, cfg.b, cfg.brightness);
             } else {
-                isOn = dynButtons[i].isPressed();
+                isOn = dynButtons[i].isPressed() || alwaysOn;
             }
             
             if (isOn && color == 0) color = applyBrightness(cfg.r, cfg.g, cfg.b, cfg.brightness);
         }
         
-        strip.setPixelColor(i, isOn ? color : 0);
+        uint32_t finalColor = isOn ? color : 0;
+        if (finalColor != lastColors[i]) {
+            strip.setPixelColor(i, finalColor);
+            lastColors[i] = finalColor;
+            changed = true;
+        }
     }
-    strip.show();
+    if (changed) strip.show();
+}
+
+// --- RAINBOW ANIMATION ---
+void rainbowStartup() {
+  for (int j = 0; j < 256; j += 4) {
+    uint32_t color = pixels.ColorHSV(j * 256, 255, 120);
+    pixels.setPixelColor(0, color);
+    pixels.show();
+    delay(4);
+  }
+  pixels.setPixelColor(0, pixels.Color(255, 255, 255));
+  pixels.show();
 }
 
 void setup() {
     Serial.begin(115200);
-    loadConfigs(); pixels.begin(); strip.begin();
-    pixels.setPixelColor(0, pixels.Color(255,255,255)); pixels.show();
-    midi.setCallbacks(sysExCallbacks);
-    Control_Surface.begin();
+    loadConfigs();
+    pixels.begin(); strip.begin();
+    rainbowStartup();
+    pioSerial.begin(31250);
+    usbmidi.setCallbacks(sysExCallbacks);
+    for (uint8_t i = 0; i < 5; i++) pinMode(bankLedPins[i], OUTPUT);
     for (auto &b : dynButtons) b.begin();
     potentiometer1.map(mapPot0); potentiometer2.map(mapPot1);
 }
@@ -337,6 +399,8 @@ uint16_t lastPotVal[2] = {0,0};
 void loop() {
     Control_Surface.loop();
     for (auto &b : dynButtons) b.update();
+    refreshBankLEDs();
+    processPendingSave();
     
     // Live View for Potentometers
     uint16_t val0 = potentiometer1.getRawValue();
@@ -348,7 +412,7 @@ void loop() {
         (uint8_t)((val1>>7)&0x7F), (uint8_t)(val1&0x7F), 
         0xF7 
       };
-      midi.sendSysEx(liveData, sizeof(liveData));
+      usbmidi.sendSysEx(liveData, sizeof(liveData));
       lastPotVal[0] = val0; lastPotVal[1] = val1;
     }
 
