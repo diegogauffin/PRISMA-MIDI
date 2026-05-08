@@ -14,7 +14,7 @@ const uint8_t HAS_SERIAL_OUT = 1;
 
 #define PIN 16           // Status LED
 #define NUMPIXELS 1
-#define PIN_STRIP 8      // Button LEDs
+#define PIN_STRIP 7      // Button LEDs
 #define NUM_LEDS 4
 
 const pin_t bankLedPins[] = {9, 10, 11, 12, 13};
@@ -23,7 +23,7 @@ Adafruit_NeoPixel statusLed(NUMPIXELS, PIN, NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel stripBtns(NUM_LEDS, PIN_STRIP, NEO_GRB + NEO_KHZ800);
 
 // --- MIDI INTERFACES ---
-#define PIN_SERIAL_TX 0
+#define PIN_SERIAL_TX 8
 SerialPIO pioSerial(PIN_SERIAL_TX, NOPIN);
 USBMIDI_Interface usbmidi;
 HardwareSerialMIDI_Interface serialmidi{pioSerial, MIDI_BAUD};
@@ -60,7 +60,7 @@ enum class ButtonMode : uint8_t {
   TapTempo = 5
 };
 
-struct ButtonConfig {
+struct __attribute__((packed)) ButtonConfig {
     ButtonMode mode;
     uint8_t number;
     uint8_t channel;
@@ -70,15 +70,15 @@ struct ButtonConfig {
     uint8_t flags; // Bit 0: latchedState, Bit 1: ledAlwaysOn
 };
 
-struct AnalogConfig {
+struct __attribute__((packed)) AnalogConfig {
   uint16_t minValue;
   uint16_t maxValue;
   uint8_t number;
   uint8_t channel;
 };
 
-struct Configuration {
-  char magic[2] = {'P', 'R'}; 
+struct __attribute__((packed)) Configuration {
+  char magic[2] = {'P', 'X'}; 
   uint8_t deviceId = 0x01;
   uint8_t bankIncBtn = 255; uint8_t bankDecBtn = 255; uint8_t globalBr = 150; 
   
@@ -88,11 +88,15 @@ struct Configuration {
   // New fields at the END to preserve offsets
   uint8_t bankR = 255; uint8_t bankG = 255; uint8_t bankB = 255; uint8_t bankBr = 130;
   uint8_t tapTempoBtn = 255;
-  uint8_t metroR = 255; uint8_t metroG = 255; uint8_t metroB = 255; uint8_t metroBr = 200;
+  uint8_t metroR = 211; uint8_t metroG = 0; uint8_t metroB = 189; uint8_t metroBr = 200;
   bool metroEnabled = false;
 };
 
 Configuration gConfig;
+
+// Forward declarations to fix scope
+void refreshBankLEDs(bool force = false);
+void updateButtonLeds(bool force = false);
 
 void loadConfigs() {
     EEPROM.begin(1024);
@@ -103,6 +107,7 @@ void loadConfigs() {
         gConfig.bankIncBtn = 255; gConfig.bankDecBtn = 255; gConfig.globalBr = 150;
         gConfig.bankR = 255; gConfig.bankG = 255; gConfig.bankB = 255; gConfig.bankBr = 130;
         gConfig.metroEnabled = false; gConfig.tapTempoBtn = 255;
+        gConfig.metroR = 211; gConfig.metroG = 0; gConfig.metroB = 189; gConfig.metroBr = 200;
         
         for (uint8_t b = 0; b < NUM_BANKS; b++) {
             for (uint8_t i = 0; i < TOTAL_BUTTONS; i++) {
@@ -131,9 +136,14 @@ void processPendingSave() {
 
 uint8_t activeBank = 0;
 
-// --- SMART POT (SOFT TAKEOVER) ---
-uint8_t potFeedbackColor = 0; // 0: None, 1: Red (Up), 2: Green (Down)
-uint32_t potFeedbackTime = 0;
+// --- GLOBAL STATE ---
+uint8_t potFeedbackColor = 0;   // 0: None, 1: Red/Up, 2: Green/Down
+unsigned long potFeedbackTime = 0;
+unsigned long beatOffTime = 0;
+bool isBeat = false;
+uint8_t clockCounter = 0;
+
+// --- ADVANCED SMART POTENTIOMETER CLASS ---
 
 template <uint8_t NumBanks> class CCSmartPotentiometer {
 public:
@@ -197,7 +207,7 @@ public:
   }
 
 private:
-  FilteredAnalog<10, 7> analog;
+  FilteredAnalog<10, 7, uint32_t> analog;
   uint8_t potIndex;
   uint8_t previousBank = 255;
   uint8_t lastValue[NumBanks];
@@ -214,22 +224,40 @@ void processMetronome() {
         isBeat = false;
     }
     
+    // Status LED logic: always show metronome color if enabled
     if (gConfig.metroEnabled || potFeedbackColor != 0) {
         if (potFeedbackColor != 0) {
             // Pot feedback priority
             bool blink = (millis() / 150) % 2;
             if (blink) {
-                if (potFeedbackColor == 1) statusLed.setPixelColor(0, statusLed.Color(255, 0, 0)); // RED
-                else statusLed.setPixelColor(0, statusLed.Color(0, 255, 0)); // GREEN
+                if (potFeedbackColor == 1) statusLed.setPixelColor(0, statusLed.Color(230, 0, 0)); // RED
+                else if (potFeedbackColor == 2) statusLed.setPixelColor(0, statusLed.Color(0, 230, 0)); // GREEN
+                else if (potFeedbackColor == 3) statusLed.setPixelColor(0, statusLed.Color(0, 0, 230)); // BLUE
             } else {
                 statusLed.setPixelColor(0, 0);
             }
-        } else if (isBeat) {
-            statusLed.setPixelColor(0, statusLed.Color((gConfig.metroR*gConfig.metroBr)/255, (gConfig.metroG*gConfig.metroBr)/255, (gConfig.metroB*gConfig.metroBr)/255));
         } else {
-            // idle state: 10% brightness of assigned color
-            statusLed.setPixelColor(0, statusLed.Color((gConfig.metroR*20)/255, (gConfig.metroG*20)/255, (gConfig.metroB*20)/255));
+            // Determine color and pulse status
+            uint8_t r = gConfig.metroR;
+            uint8_t g = gConfig.metroG;
+            uint8_t b = gConfig.metroB;
+            
+            if (isBeat) {
+                // Full brightness pulse
+                statusLed.setPixelColor(0, statusLed.Color(r, g, b));
+            } else {
+                // Dim state (15% brightness) to avoid color distortion
+                statusLed.setPixelColor(0, statusLed.Color((r*40)/255, (g*40)/255, (b*40)/255));
+            }
         }
+        
+        static uint32_t lastShow = 0;
+        if (millis() - lastShow > 10) {
+            statusLed.show();
+            lastShow = millis();
+        }
+    } else {
+        statusLed.setPixelColor(0, 0);
         statusLed.show();
     }
 }
@@ -238,24 +266,36 @@ void processMetronome() {
 class MyMIDIInput : public MIDI_Callbacks {
 public:
   void onRealTimeMessage(MIDI_Interface &, RealTimeMessage rt) override {
+    // DIAGNOSTIC: Flash status LED briefly on MIDI Start/Continue
+    if (rt.message == 0xFA || rt.message == 0xFB) {
+        clockCounter = 0;
+        isBeat = true;
+        beatOffTime = millis() + 40; // Super sharp flash on start
+        return;
+    }
+
     if (gConfig.metroEnabled && rt.message == 0xF8) { 
         clockCounter++;
         if (clockCounter >= 24) { 
             clockCounter = 0;
             isBeat = true;
-            beatOffTime = millis() + 80; 
+            beatOffTime = millis() + 100; // Increased duration for better visibility
         }
     }
   }
 
   void onSysExMessage(MIDI_Interface &midi_if, SysExMessage msg) override {
     if (msg.length >= 5 && msg.data[1] == SYSEX_MAN_ID && msg.data[2] == gConfig.deviceId) {
+      // FEEDBACK: Blink BLUE on any valid SysEx from MIDI Hangar
+      potFeedbackColor = 3; 
+      potFeedbackTime = millis() + 150; 
+
       uint8_t cmd = msg.data[3];
       if (cmd == CMD_GET_INFO) {
         const char* name = "PRISMA MR9 METRO"; uint8_t nLen = strlen(name);
         uint8_t total = 16 + nLen; uint8_t *data = new uint8_t[total];
         data[0] = 0xF0; data[1] = SYSEX_MAN_ID; data[2] = gConfig.deviceId; data[3] = CMD_INFO_RESPONSE;
-        data[4] = 3; data[5] = 7; data[6] = 2; // v3.7.2
+        data[4] = 3; data[5] = 8; data[6] = 0; // v3.8.0
         data[7] = MODEL_FAMILY; data[8] = NUM_MAIN_BUTTONS;
         data[9] = N_ANALOG_INPUTS; data[10] = NUM_AUX_JACKS; data[11] = NUM_BANKS; data[12] = BANK_INDICATOR_TYPE;
         data[13] = HAS_SERIAL_OUT; data[14] = nLen; memcpy(&data[15], name, nLen); data[total - 1] = 0xF7;
@@ -295,6 +335,13 @@ public:
           gConfig.bankBr = msg.data[13];
         }
         saveConfigs();
+      } else if (cmd == CMD_SET_BANK_LEDS && msg.length >= 13) {
+        gConfig.bankR = (msg.data[4] << 7) | msg.data[5];
+        gConfig.bankG = (msg.data[6] << 7) | msg.data[7];
+        gConfig.bankB = (msg.data[8] << 7) | msg.data[9];
+        gConfig.bankBr = (msg.data[10] << 7) | msg.data[11];
+        saveConfigs();
+        refreshBankLEDs(true);
       } else if (cmd == CMD_GET_GLOBAL) {
         uint8_t d[] = { 
           0xF0, SYSEX_MAN_ID, gConfig.deviceId, CMD_GET_GLOBAL,
@@ -350,9 +397,6 @@ public:
 
 MyMIDIInput sysExCallbacks;
 
-// Forward declarations to fix scope
-void refreshBankLEDs(bool force = false);
-void updateButtonLeds(bool force = false);
 
 // --- DYNAMIC BUTTONS (MR9 PINS) ---
 class DynamicButton : public Updatable<MIDIOutputElement> {
@@ -403,8 +447,8 @@ private:
 };
 
 DynamicButton dynButtons[TOTAL_BUTTONS] = { 
-  {0, 5}, {1, 4}, {2, 3}, {3, 2}, 
-  {4, 6}, {5, 7}, {6, 14}, {7, 15} 
+  {0, 5}, {1, 4}, {2, 3}, {3, 2},    // Main buttons
+  {4, 0}, {5, 1}, {6, 14}, {7, 15}   // Aux jacks → pins 0, 1, 14, 15
 };
 
 // --- LED REFRESH (MR9 DISCRETE) ---
@@ -429,14 +473,14 @@ void updateButtonLeds(bool force) {
         bool isGlobal = (i == gConfig.bankIncBtn || i == gConfig.bankDecBtn);
         bool isTapTempo = (cfg.mode == ButtonMode::TapTempo) && gConfig.metroEnabled;
 
-        if (isGlobal) {
+        if (isTapTempo && isBeat) {
+            isOn = true;
+            color = stripBtns.Color(gConfig.metroR, gConfig.metroG, gConfig.metroB);
+        } else if (isGlobal) {
             isOn = true;
             uint8_t br = (gConfig.globalBr > 210) ? 210 : gConfig.globalBr; 
             if (dynButtons[i].isPressed()) color = stripBtns.Color(255, 255, 255);
             else color = stripBtns.Color(br, br, br);
-        } else if (isTapTempo && isBeat) {
-            isOn = true;
-            color = stripBtns.Color((gConfig.metroR*gConfig.metroBr)/255, (gConfig.metroG*gConfig.metroBr)/255, (gConfig.metroB*gConfig.metroBr)/255);
         } else {
             bool alwaysOn = (cfg.flags >> 1) & 0x01;
             if (cfg.mode == ButtonMode::Latched) isOn = (cfg.flags & 0x01);
@@ -467,11 +511,12 @@ void updateButtonLeds(bool force) {
 void setup() {
     loadConfigs();
     statusLed.begin(); stripBtns.begin();
-    pioSerial.begin(31250);
+    // pioSerial is initialized by Control_Surface.begin() via serialmidi
     usbmidi.setCallbacks(sysExCallbacks);
-    Control_Surface.begin();
+    serialmidi.setCallbacks(sysExCallbacks);
     for (uint8_t i = 0; i < 5; i++) pinMode(bankLedPins[i], OUTPUT);
     for (auto &b : dynButtons) b.begin();
+    Control_Surface.begin(); // Start interface LAST
 }
 
 void loop() {
